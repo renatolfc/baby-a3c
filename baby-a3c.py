@@ -1,6 +1,9 @@
 # Baby Advantage Actor-Critic | Sam Greydanus | October 2017 | MIT License
 
 from __future__ import print_function
+
+import os
+
 import torch, os, gym, time, glob, argparse, sys
 import numpy as np
 from scipy.signal import lfilter
@@ -10,9 +13,197 @@ import torch.nn.functional as F
 import torch.multiprocessing as mp
 os.environ['OMP_NUM_THREADS'] = '1'
 
+from ale_python_interface import ALEInterface
+
+from gym.utils import seeding
+
+
+ROMPATH = os.path.expanduser('~/atari_roms/')
+
+
+ACTION_MEANING = {
+    0 : "NOOP",
+    1 : "FIRE",
+    2 : "UP",
+    3 : "RIGHT",
+    4 : "LEFT",
+    5 : "DOWN",
+    6 : "UPRIGHT",
+    7 : "UPLEFT",
+    8 : "DOWNRIGHT",
+    9 : "DOWNLEFT",
+    10 : "UPFIRE",
+    11 : "RIGHTFIRE",
+    12 : "LEFTFIRE",
+    13 : "DOWNFIRE",
+    14 : "UPRIGHTFIRE",
+    15 : "UPLEFTFIRE",
+    16 : "DOWNRIGHTFIRE",
+    17 : "DOWNLEFTFIRE",
+}
+
+
+class LazyAleEnv:
+    def __init__(self, envname, frameskip=(2, 5), obs_type='image',
+                 repeat_action_probability=0.0, full_action_space=False):
+        if not envname.endswith('.bin'):
+            envname = envname + '.bin'
+        self.envname = envname
+        self.frameskip = frameskip
+
+        assert obs_type in ('ram', 'image')
+        self._obs_type = obs_type
+
+        self.ale = ALEInterface()
+        self.ale.setFloat(b"repeat_action_probability", repeat_action_probability);
+        self.seed()
+
+        self._action_set = (self.ale.getLegalActionSet() if full_action_space
+                            else self.ale.getMinimalActionSet())
+        self.action_space = gym.spaces.Discrete(len(self._action_set))
+
+        screen_width, screen_height = self.ale.getScreenDims()
+
+        if self._obs_type == 'ram':
+            self.observation_space = gym.spaces.Box(low=0, high=255, dtype=np.uint8, shape=(128,))
+        elif self._obs_type == 'image':
+            self.observation_space = gym.spaces.Box(low=0, high=255, shape=(screen_height, screen_width, 3), dtype=np.uint8)
+        else:
+            raise error.Error('Unrecognized observation type: {}'.format(self._obs_type))
+
+        self.avail_modes = self.ale.getAvailableModes()
+        self.avail_diff  = self.ale.getAvailableDifficulties()
+        self.all_modes_diffs = [(m, d) for m in self.avail_modes for d in self.avail_diff]
+
+    def set_mode_diff(self, idx):
+        offset = idx % len(self.all_modes_diffs)
+        mode, diff = self.all_modes_diffs[offset]
+
+        print('Mode {0} difficulty {1} - idx: {2}'.format(mode, diff, idx))
+
+        self.ale.setDifficulty(diff)
+        self.ale.setMode(mode)
+        self.ale.reset_game()
+
+    def seed(self, seed=None):
+        self.np_random, seed1 = seeding.np_random(seed)
+        seed2 = seeding.hash_seed(seed1 + 1) % 2**31
+        self.ale.setInt(b'random_seed', seed2)
+        self.ale.loadROM(os.path.join(ROMPATH, self.envname).encode('utf-8'))
+        return [seed1, seed2]
+
+    def step(self, a):
+        reward = 0.0
+        action = self._action_set[a]
+
+        if isinstance(self.frameskip, int):
+            num_steps = self.frameskip
+        else:
+            num_steps = self.np_random.randint(self.frameskip[0], self.frameskip[1])
+        for _ in range(num_steps):
+            reward += self.ale.act(action)
+        ob = self._get_obs()
+
+        return ob, reward, self.ale.game_over(), {"ale.lives": self.ale.lives()}
+
+    def _get_image(self):
+        return self.ale.getScreenRGB2()
+
+    def _get_ram(self):
+        return to_ram(self.ale)
+
+    @property
+    def _n_actions(self):
+        return len(self._action_set)
+
+    def _get_obs(self):
+        if self._obs_type == 'ram':
+            return self._get_ram()
+        elif self._obs_type == 'image':
+            img = self._get_image()
+        return img
+
+    # return: (states, observations)
+    def reset(self):
+        self.ale.reset_game()
+        return self._get_obs()
+
+    def render(self, mode='human'):
+        img = self._get_image()
+        if mode == 'rgb_array':
+            return img
+        elif mode == 'human':
+            from gym.envs.classic_control import rendering
+            if self.viewer is None:
+                self.viewer = rendering.SimpleImageViewer()
+            self.viewer.imshow(img)
+            return self.viewer.isopen
+
+    def close(self):
+        if self.viewer is not None:
+            self.viewer.close()
+            self.viewer = None
+
+    def get_action_meanings(self):
+        return [ACTION_MEANING[i] for i in self._action_set]
+
+    def get_keys_to_action(self):
+        KEYWORD_TO_KEY = {
+            'UP':      ord('w'),
+            'DOWN':    ord('s'),
+            'LEFT':    ord('a'),
+            'RIGHT':   ord('d'),
+            'FIRE':    ord(' '),
+        }
+
+        keys_to_action = {}
+
+        for action_id, action_meaning in enumerate(self.get_action_meanings()):
+            keys = []
+            for keyword, key in KEYWORD_TO_KEY.items():
+                if keyword in action_meaning:
+                    keys.append(key)
+            keys = tuple(sorted(keys))
+
+            assert keys not in keys_to_action
+            keys_to_action[keys] = action_id
+
+        return keys_to_action
+
+    def clone_state(self):
+        """Clone emulator state w/o system state. Restoring this state will
+        *not* give an identical environment. For complete cloning and restoring
+        of the full state, see `{clone,restore}_full_state()`."""
+        state_ref = self.ale.cloneState()
+        state = self.ale.encodeState(state_ref)
+        self.ale.deleteState(state_ref)
+        return state
+
+    def restore_state(self, state):
+        """Restore emulator state w/o system state."""
+        state_ref = self.ale.decodeState(state)
+        self.ale.restoreState(state_ref)
+        self.ale.deleteState(state_ref)
+
+    def clone_full_state(self):
+        """Clone emulator state w/ system state including pseudorandomness.
+        Restoring this state will give an identical environment."""
+        state_ref = self.ale.cloneSystemState()
+        state = self.ale.encodeState(state_ref)
+        self.ale.deleteState(state_ref)
+        return state
+
+    def restore_full_state(self, state):
+        """Restore emulator state w/ system state including pseudorandomness."""
+        state_ref = self.ale.decodeState(state)
+        self.ale.restoreSystemState(state_ref)
+        self.ale.deleteState(state_ref)
+
+
+
 def get_args():
     parser = argparse.ArgumentParser(description=None)
-    parser.add_argument('--env', default='Breakout-v4', type=str, help='gym environment')
+    parser.add_argument('--env', default='breakout', type=str, help='gym environment')
     parser.add_argument('--processes', default=20, type=int, help='number of processes to train with')
     parser.add_argument('--render', default=False, type=bool, help='renders the atari environment')
     parser.add_argument('--test', default=False, type=bool, help='sets lr=0, chooses most likely actions')
@@ -68,7 +259,7 @@ class SharedAdam(torch.optim.Adam): # extend a pytorch optimizer so it shares gr
                 state['shared_steps'], state['step'] = torch.zeros(1).share_memory_(), 0
                 state['exp_avg'] = p.data.new().resize_as_(p.data).zero_().share_memory_()
                 state['exp_avg_sq'] = p.data.new().resize_as_(p.data).zero_().share_memory_()
-                
+
         def step(self, closure=None):
             for group in self.param_groups:
                 for p in group['params']:
@@ -85,7 +276,7 @@ def cost_func(args, values, logps, actions, rewards):
     logpys = logps.gather(1, torch.tensor(actions).view(-1,1))
     gen_adv_est = discount(delta_t, args.gamma * args.tau)
     policy_loss = -(logpys.view(-1) * torch.FloatTensor(gen_adv_est.copy())).sum()
-    
+
     # l2 loss over value estimator
     rewards[-1] += args.gamma * np_values[-1]
     discounted_r = discount(np.asarray(rewards), args.gamma)
@@ -96,8 +287,9 @@ def cost_func(args, values, logps, actions, rewards):
     return policy_loss + 0.5 * value_loss - 0.01 * entropy_loss
 
 def train(shared_model, shared_optimizer, rank, args, info):
-    env = gym.make(args.env) # make a local (unshared) environment
+    env = LazyAleEnv(args.env, frameskip=0) # make a local (unshared) environment
     env.seed(args.seed + rank) ; torch.manual_seed(args.seed + rank) # seed everything
+    env.set_mode_diff(rank)
     model = NNPolicy(channels=1, memsize=args.hidden, num_actions=args.num_actions) # a local/unshared model
     state = torch.tensor(prepro(env.reset())) # get first state
 
@@ -122,7 +314,7 @@ def train(shared_model, shared_optimizer, rank, args, info):
             state = torch.tensor(prepro(state)) ; epr += reward
             reward = np.clip(reward, -1, 1) # reward
             done = done or episode_length >= 1e4 # don't playing one ep for too long
-            
+
             info['frames'].add_(1) ; num_frames = int(info['frames'].item())
             if num_frames % 2e6 == 0: # save every 2M frames
                 printlog(args, '\n\t{:.0f}M frames: saved model\n'.format(num_frames/1e6))
@@ -164,12 +356,12 @@ if __name__ == "__main__":
         mp.set_start_method('spawn') # this must not be in global scope
     elif sys.platform == 'linux' or sys.platform == 'linux2':
         raise "Must be using Python 3 with linux!" # or else you get a deadlock in conv2d
-    
+
     args = get_args()
     args.save_dir = '{}/'.format(args.env.lower()) # keep the directory structure simple
     if args.render:  args.processes = 1 ; args.test = True # render mode -> test mode w one process
     if args.test:  args.lr = 0 # don't train in render mode
-    args.num_actions = gym.make(args.env).action_space.n # get the action space of this game
+    args.num_actions = LazyAleEnv(args.env).action_space.n # get the action space of this game
     os.makedirs(args.save_dir) if not os.path.exists(args.save_dir) else None # make dir to save models etc.
 
     torch.manual_seed(args.seed)
@@ -179,7 +371,7 @@ if __name__ == "__main__":
     info = {k: torch.DoubleTensor([0]).share_memory_() for k in ['run_epr', 'run_loss', 'episodes', 'frames']}
     info['frames'] += shared_model.try_load(args.save_dir) * 1e6
     if int(info['frames'].item()) == 0: printlog(args,'', end='', mode='w') # clear log file
-    
+
     processes = []
     for rank in range(args.processes):
         p = mp.Process(target=train, args=(shared_model, shared_optimizer, rank, args, info))
